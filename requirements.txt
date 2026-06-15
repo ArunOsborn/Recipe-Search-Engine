@@ -1,0 +1,13 @@
+beautifulsoup4
+lxml
+nltk
+spacy
+matplotlib
+numpy
+
+# Additional setup (not installed via pip by default):
+# - Download spaCy model: python -m spacy download en_core_web_sm
+# - Download NLTK data (run once in Python):
+#     import nltk
+#     nltk.download('punkt')
+#     nltk.download('stopwords')
