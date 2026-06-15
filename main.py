@@ -14,12 +14,30 @@ from math import log10 as log
 import string
 import re
 import os
+import sys
 
 import time  # Just used for checking how long indexing takes
 import json
+import requests
+from urllib.parse import urlparse, urljoin
+import random
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.5",
+    "Referer": "https://www.bbcgoodfood.com/",
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 # %%
 
@@ -78,9 +96,40 @@ def tokenize(text):
     tokens = [stemmer.stem(c) for c in tokens if (not token in used_stopwords) and (not c in unwanted_punctuation)]  # Punctuation removed after name checks so it can seperate two names properly. Stemming done after
     return tokens
 
-def processFile(file):
+def processFile(file, scrapeForDomain="", maxScrapeDepth=0) -> list:
     soup = BeautifulSoup(file, "lxml")
+    # When indexing local saved pages we may not have a base URL; derive one
+    base_url = None
+    if scrapeForDomain:
+        base_url = f"https://{scrapeForDomain}"
+    return processSoup(soup, scrapeForDomain, maxScrapeDepth, base_url=base_url, visited=None)
 
+def _extract_text_from_jsonld(soup) -> str:
+    """Try to pull meaningful text out of any JSON-LD Recipe blocks."""
+    text_parts = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+        except Exception:
+            continue
+        if isinstance(data, list):
+            data = next((d for d in data if d.get("@type") == "Recipe"), None)
+        if data and data.get("@type") == "Recipe":
+            for k in ("name", "description", "recipeYield"):
+                if data.get(k):
+                    text_parts.append(str(data.get(k)))
+            for ing in data.get("recipeIngredient", []):
+                text_parts.append(str(ing))
+            for step in data.get("recipeInstructions", []):
+                if isinstance(step, dict):
+                    text_parts.append(step.get("text", ""))
+                else:
+                    text_parts.append(str(step))
+            return " ".join(text_parts)
+    return ""
+
+
+def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visited=None) -> list:
     # Attempts to get the most relevant starting point to search through
     if soup.find("main"):
         main = soup.find("main")
@@ -101,12 +150,69 @@ def processFile(file):
     relevant = main.find_all({re.compile('^h[1-6]$'),"p","li"})
     text = ""
     for element in relevant:
-        text += (" ").join(element.findAll(text=True)) # Adds new line so the last word of this element and the first word of the next don't join
+        text += (" ").join(element.find_all(string=True)) # Adds new line so the last word of this element and the first word of the next don't join
 
     a_elems = main.find_all("a")
+    # Prepare visited set to avoid repeated fetches
+    if visited is None:
+        visited = set()
+
     for element in a_elems:
-        if element.parent.name != "li": # Filters out the majority of menus and table of contents
+        # Add link text for non-menu links
+        if element.parent.name != "li":
             text += element.text
+
+        # Scrape linked pages when requested
+        if scrapeForDomain and maxScrapeDepth > 0:
+            href = element.get("href")
+            if not href:
+                continue
+
+            # Build absolute URL
+            if href.startswith("//"):
+                href = "https:" + href
+            if href.startswith("/") and base_url:
+                full_link = urljoin(base_url, href)
+            elif href.startswith("http"):
+                full_link = href
+            else:
+                # Relative link without base; try joining to provided base_url
+                full_link = urljoin(base_url or "", href)
+
+            # Filter to domain
+            try:
+                netloc = urlparse(full_link).netloc
+            except Exception:
+                netloc = ""
+            if scrapeForDomain not in full_link and scrapeForDomain not in netloc:
+                continue
+
+            # Avoid refetching same URL
+            norm = full_link.split('#')[0].rstrip('/')
+            if norm in visited:
+                continue
+            visited.add(norm)
+
+            try:
+                print(f"Scraping {full_link} (depth {maxScrapeDepth})")
+                # Polite delay between requests
+                time.sleep(random.uniform(0.5, 1.3))
+                resp = SESSION.get(full_link, timeout=10)
+                resp.raise_for_status()
+                child_soup = BeautifulSoup(resp.text, "lxml")
+
+                # Prefer structured JSON-LD content when available
+                jsonld_text = _extract_text_from_jsonld(child_soup)
+                if jsonld_text:
+                    text += " " + jsonld_text
+                else:
+                    # Recurse into the child page, passing along visited set
+                    # Derive a base for relative links on the child page
+                    child_base = f"{urlparse(full_link).scheme}://{urlparse(full_link).netloc}"
+                    text += " ".join(processSoup(child_soup, scrapeForDomain, maxScrapeDepth-1, base_url=child_base, visited=visited))
+            except Exception as e:
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                print(f"Error scraping {full_link}: {e} on line {exc_tb.tb_lineno}")
 
     return tokenize(text)
 
@@ -120,13 +226,13 @@ def generateIndexes():
     # Processes every file in the wiki folder
 
     # Adds terms to the index
-    folder_name = "ueapeople"
+    folder_name = "websites/bbcgoodfood"
     #folder_name = "../ueasmall"
     print("Processing "+str(len(os.listdir(folder_name)))+" files...")
     for file in os.listdir(folder_name):
         f = open("" + folder_name+ "/" + file, "r", encoding="utf8")
 
-        tokens = processFile(f)
+        tokens = processFile(f, scrapeForDomain="bbcgoodfood.com", maxScrapeDepth=2)
 
         # Adds file to docID
         if file not in docID:
