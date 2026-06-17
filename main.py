@@ -146,6 +146,224 @@ def _extract_text_from_jsonld(soup) -> str:
     return ""
 
 
+def extract_recipe_metadata(soup, url=None):
+    """Extract structured recipe metadata from a page.
+
+    Returns a dict with keys: preparation_time (minutes), cooking_time (minutes),
+    total_time (minutes), portions_count (int), ingredients (list of {name,quantity,unit}),
+    instructions (list of steps), link (string).
+    Best-effort: prefers site JSON payloads (props.pageProps), then schema.org JSON-LD,
+    then HTML heuristics.
+    """
+    meta = {
+        "preparation_time": None,
+        "cooking_time": None,
+        "total_time": None,
+        "portions_count": None,
+        "ingredients": [],
+        "instructions": [],
+        "link": url or "",
+    }
+
+    # 1) Look for site JS payloads: props.pageProps or window.__INITIAL_STATE__ patterns
+    scripts = soup.find_all("script")
+    for script in scripts:
+        txt = script.string
+        if not txt:
+            continue
+        # naive search for props.pageProps JSON
+        if "props" in txt and "pageProps" in txt and "ingredients" in txt:
+            try:
+                # attempt to extract a JSON object starting at first '{'
+                start = txt.find('{')
+                candidate = txt[start:]
+                data = json.loads(candidate)
+            except Exception:
+                # fallback: try to find a smaller JSON by regex (not perfect)
+                try:
+                    m = re.search(r"(\{\"props\":.*\})", txt, flags=re.S)
+                    if m:
+                        data = json.loads(m.group(1))
+                    else:
+                        data = None
+                except Exception:
+                    data = None
+            if data:
+                # drill into common path
+                props = data.get("props") or data.get("__INITIAL_STATE__")
+                if props:
+                    pageProps = props.get("pageProps") or props.get("props")
+                    if pageProps:
+                        # BBC example: pageProps.page or pageProps.schema
+                        # Try multiple known locations
+                        candidate = None
+                        if isinstance(pageProps, dict):
+                            candidate = pageProps
+                        else:
+                            candidate = None
+                        if candidate:
+                            # ingredients
+                            ings = candidate.get("ingredients") or candidate.get("ingredientsGroups") or candidate.get("ingredientsList")
+                            if ings and isinstance(ings, list):
+                                for g in ings:
+                                    # BBC structure uses nested lists
+                                    if isinstance(g, dict) and "ingredients" in g:
+                                        for ing in g.get("ingredients", []):
+                                            name = ing.get("ingredientText") or ing.get("term", {}).get("display") or ing.get("ingredient") or ing.get("name")
+                                            qty = None
+                                            unit = None
+                                            if ing.get("metricQuantity") is not None:
+                                                qty = ing.get("metricQuantity")
+                                                unit = ing.get("metricUnit")
+                                            elif ing.get("quantityText"):
+                                                qty_unit = ing.get("quantityText")
+                                                # very small parse: split numeric and unit
+                                                m = re.match(r"([0-9/.]+)\s*(.*)", qty_unit)
+                                                if m:
+                                                    try:
+                                                        qty = float(m.group(1))
+                                                    except Exception:
+                                                        qty = None
+                                                    unit = m.group(2).strip() or None
+                                            meta["ingredients"].append({"name": name, "quantity": qty, "unit": unit})
+                            # method / steps
+                            steps = candidate.get("methodSteps") or candidate.get("method") or candidate.get("methodSteps")
+                            if steps and isinstance(steps, list):
+                                for s in steps:
+                                    # BBC uses list of {type:step, content:[{type:html,data:{value:...}}]}
+                                    if isinstance(s, dict):
+                                        if s.get("content"):
+                                            for c in s.get("content"):
+                                                if isinstance(c, dict) and c.get("data") and c["data"].get("value"):
+                                                    # strip html
+                                                    txt = BeautifulSoup(c["data"]["value"], "lxml").get_text(strip=True)
+                                                    if txt:
+                                                        meta["instructions"].append(txt)
+                                        elif s.get("text"):
+                                            meta["instructions"].append(s.get("text"))
+                                
+                            # times and servings
+                            cook_p = candidate.get("cookAndPrepTime") or candidate.get("recipe") or {}
+                            if isinstance(cook_p, dict):
+                                if cook_p.get("preparationMin") is not None:
+                                    meta["preparation_time"] = int(cook_p.get("preparationMin"))
+                                elif cook_p.get("prep_time") is not None:
+                                    meta["preparation_time"] = int(cook_p.get("prep_time"))
+                                if cook_p.get("cookingMin") is not None:
+                                    meta["cooking_time"] = int(cook_p.get("cookingMin"))
+                                if cook_p.get("total") is not None:
+                                    meta["total_time"] = int(cook_p.get("total"))
+                            if candidate.get("servings"):
+                                try:
+                                    meta["portions_count"] = int(candidate.get("servings"))
+                                except Exception:
+                                    pass
+
+    # 2) schema.org JSON-LD
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+        except Exception:
+            continue
+        if isinstance(data, list):
+            data = next((d for d in data if d.get("@type") == "Recipe"), None)
+        if data and data.get("@type") == "Recipe":
+            # times: PT20M etc. convert to minutes
+            def parse_duration(pt):
+                if not pt:
+                    return None
+                m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?", pt)
+                if not m:
+                    return None
+                hours = int(m.group(1)) if m.group(1) else 0
+                mins = int(m.group(2)) if m.group(2) else 0
+                return hours * 60 + mins
+
+            prep = parse_duration(data.get("prepTime") or data.get("preparationTime"))
+            cook = parse_duration(data.get("cookTime") or data.get("cookingTime"))
+            total = parse_duration(data.get("totalTime"))
+            if prep:
+                meta["preparation_time"] = prep
+            if cook:
+                meta["cooking_time"] = cook
+            if total:
+                meta["total_time"] = total
+
+            # servings
+            if data.get("recipeYield"):
+                try:
+                    meta["portions_count"] = int(re.sub(r"\D", "", str(data.get("recipeYield"))))
+                except Exception:
+                    pass
+
+            # ingredients
+            for ing in data.get("recipeIngredient", []):
+                # naive parse: "200g strawberries hulled and chopped" -> qty 200 unit g name strawberries + note
+                qty = None
+                unit = None
+                name = ing
+                m = re.match(r"^\s*([0-9/.]+)\s*([a-zA-Z]+)\s+(.*)", ing)
+                if m:
+                    try:
+                        qty = float(m.group(1))
+                    except Exception:
+                        qty = None
+                    unit = m.group(2)
+                    name = m.group(3)
+                meta["ingredients"].append({"name": name, "quantity": qty, "unit": unit})
+
+            # instructions
+            instr = data.get("recipeInstructions") or []
+            for step in instr:
+                if isinstance(step, dict):
+                    if step.get("text"):
+                        meta["instructions"].append(step.get("text"))
+                else:
+                    meta["instructions"].append(str(step))
+
+            # link
+            if data.get("url"):
+                meta["link"] = data.get("url")
+
+            break
+
+    # 3) HTML fallbacks: look for ingredient lists and method lists
+    if not meta["ingredients"]:
+        # common selectors
+        for sel in [".ingredients", ".recipe-ingredients", "#ingredients", ".ingredients-list"]:
+            block = soup.select_one(sel)
+            if block:
+                for li in block.find_all("li"):
+                    txt = li.get_text(strip=True)
+                    if txt:
+                        meta["ingredients"].append({"name": txt, "quantity": None, "unit": None})
+                if meta["ingredients"]:
+                    break
+
+    if not meta["instructions"]:
+        for sel in [".method", ".method-steps", ".directions", ".instructions", "#method"]:
+            block = soup.select_one(sel)
+            if block:
+                for li in block.find_all(["li", "p"]):
+                    txt = li.get_text(strip=True)
+                    if txt:
+                        meta["instructions"].append(txt)
+                if meta["instructions"]:
+                    break
+
+    # compute total if missing
+    try:
+        if meta["total_time"] is None:
+            pt = meta.get("preparation_time") or 0
+            ct = meta.get("cooking_time") or 0
+            if pt or ct:
+                meta["total_time"] = int(pt + ct)
+    except Exception:
+        pass
+
+    return meta
+
+
 def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visited=None, source_name=None, useCache=True) -> list:
     # Attempts to get the most relevant starting point to search through
     if soup.find("main"):
@@ -180,6 +398,12 @@ def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visit
     page_key = source_name or (f"{urlparse(base_url).netloc}/root" if base_url else "inline")
     main_tokens = tokenize(text)
     results.append({"file": page_key, "tokens": main_tokens})
+    # Extract recipe metadata for the main page and attach to results entries as 'meta'
+    try:
+        main_meta = extract_recipe_metadata(soup, url=(base_url or ""))
+        results[-1]["meta"] = main_meta
+    except Exception as e:
+        results[-1]["meta"] = {}
 
     def sanitize_filename(url: str) -> str:
         p = urlparse(url)
@@ -259,7 +483,12 @@ def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visit
                 if jsonld_text:
                     child_tokens = tokenize(jsonld_text)
                     child_key = os.path.relpath(cache_path)
-                    results.append({"file": child_key, "tokens": child_tokens})
+                    child_meta = {}
+                    try:
+                        child_meta = extract_recipe_metadata(child_soup, url=full_link)
+                    except Exception:
+                        child_meta = {}
+                    results.append({"file": child_key, "tokens": child_tokens, "meta": child_meta})
                 else:
                     # Recurse into the child page, passing along visited set
                     child_base = f"{urlparse(full_link).scheme}://{urlparse(full_link).netloc}"
@@ -293,11 +522,22 @@ def generateIndexes(useCache=True):
         for entry in entries:
             file_key = entry.get("file")
             tokens = entry.get("tokens", [])
+            entry_meta = entry.get("meta", {})
 
             # Adds file to docID
             if file_key not in docID:
                 docID[file_key] = len(docID)
             d = docID[file_key]
+
+            # Map metadata to integer docID in docInfo
+            try:
+                if entry_meta:
+                    # ensure docInfo keys are strings for JSON-friendly storage
+                    docInfo[str(d)] = entry_meta
+                elif str(d) not in docInfo:
+                    docInfo[str(d)] = {}
+            except Exception:
+                pass
 
             for term in tokens:  # Loops through and adds occurrence of term into index
                 # Gets vocabID
@@ -323,6 +563,9 @@ def generateIndexes(useCache=True):
     # Saves vocabIDs
     with open("indexes/vocabID.json", "w", encoding='utf-8') as file:
         json.dump(vocabID, file, indent=4)
+    # Saves docInfo
+    with open("indexes/docInfo.json", "w", encoding='utf-8') as file:
+        json.dump(docInfo, file, indent=4)
     print("Saved")
 
 # %%
@@ -447,15 +690,18 @@ def query(q):
 docID = {}
 postings = {}
 vocabID = {}
+docInfo = {}  # New dictionary to store additional document information (Preparation time, cooking time, total time, portions count, ingredients, intructions, link)
 
 def loadData():
-    global docID,postings,vocabID
+    global docID,postings,vocabID,docInfo
     with open("indexes/postings.json", "r", encoding='utf-8') as file:
         postings = json.load(file)
     with open("indexes/docID.json", "r", encoding='utf-8') as file:
         docID = json.load(file)
     with open("indexes/vocabID.json", "r", encoding='utf-8') as file:
         vocabID = json.load(file)
+    with open("indexes/docInfo.json", "r", encoding='utf-8') as file:
+        docInfo = json.load(file)
 
 # %%
 
@@ -468,6 +714,9 @@ def clearData():
         json.dump({}, file, indent=4)
     # Saves vocabIDs
     with open("indexes/vocabID.json", "w", encoding='utf-8') as file:
+        json.dump({}, file, indent=4)
+    # Saves docInfo
+    with open("indexes/docInfo.json", "w", encoding='utf-8') as file:
         json.dump({}, file, indent=4)
     print("Deleted")
 
