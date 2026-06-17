@@ -15,6 +15,7 @@ import string
 import re
 import os
 import sys
+import hashlib
 
 import time  # Just used for checking how long indexing takes
 import json
@@ -96,13 +97,29 @@ def tokenize(text):
     tokens = [stemmer.stem(c) for c in tokens if (not token in used_stopwords) and (not c in unwanted_punctuation)]  # Punctuation removed after name checks so it can seperate two names properly. Stemming done after
     return tokens
 
-def processFile(file, scrapeForDomain="", maxScrapeDepth=0) -> list:
-    soup = BeautifulSoup(file, "lxml")
+def processFile(file, scrapeForDomain="", maxScrapeDepth=0, useCache=True) -> list:
+    """Process a file-like object or file path and return a list of {file, tokens}.
+
+    If scraping is enabled, this will also download child pages (cached under
+    `websites/<domain>/`) and include them as separate returned entries.
+    """
+    # Read HTML from file-like object or path
+    if hasattr(file, "read"):
+        html = file.read()
+        source_name = os.path.relpath(file.name) if hasattr(file, "name") else "inline"
+    else:
+        # treat 'file' as a path
+        with open(file, "r", encoding="utf8") as fh:
+            html = fh.read()
+        source_name = os.path.relpath(file)
+
+    soup = BeautifulSoup(html, "lxml")
     # When indexing local saved pages we may not have a base URL; derive one
     base_url = None
     if scrapeForDomain:
         base_url = f"https://{scrapeForDomain}"
-    return processSoup(soup, scrapeForDomain, maxScrapeDepth, base_url=base_url, visited=None)
+    # visited set shared across recursion in a single processFile call
+    return processSoup(soup, scrapeForDomain, maxScrapeDepth, base_url=base_url, visited=set(), source_name=source_name, useCache=useCache)
 
 def _extract_text_from_jsonld(soup) -> str:
     """Try to pull meaningful text out of any JSON-LD Recipe blocks."""
@@ -129,7 +146,7 @@ def _extract_text_from_jsonld(soup) -> str:
     return ""
 
 
-def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visited=None) -> list:
+def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visited=None, source_name=None, useCache=True) -> list:
     # Attempts to get the most relevant starting point to search through
     if soup.find("main"):
         main = soup.find("main")
@@ -157,10 +174,29 @@ def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visit
     if visited is None:
         visited = set()
 
+    results = []
+
+    # Main page tokens (use provided source_name or a generic placeholder)
+    page_key = source_name or (f"{urlparse(base_url).netloc}/root" if base_url else "inline")
+    main_tokens = tokenize(text)
+    results.append({"file": page_key, "tokens": main_tokens})
+
+    def sanitize_filename(url: str) -> str:
+        p = urlparse(url)
+        path_part = p.path.strip('/').replace('/', '_')
+        if not path_part:
+            path_part = 'index'
+        h = hashlib.sha1(url.encode('utf-8')).hexdigest()[:10]
+        return f"{path_part}_{h}.html"
+
     for element in a_elems:
-        # Add link text for non-menu links
+        # Add link text for non-menu links to main tokens (heuristic)
         if element.parent.name != "li":
-            text += element.text
+            # append small amount of link text to main tokens to preserve context
+            link_text = element.get_text(strip=True)
+            if link_text:
+                # we don't retokenize here; just append raw text to be safe
+                main_tokens += tokenize(link_text)
 
         # Scrape linked pages when requested
         if scrapeForDomain and maxScrapeDepth > 0:
@@ -195,64 +231,87 @@ def processSoup(soup, scrapeForDomain="", maxScrapeDepth=0, base_url=None, visit
 
             try:
                 print(f"Scraping {full_link} (depth {maxScrapeDepth})")
-                # Polite delay between requests
-                time.sleep(random.uniform(0.5, 1.3))
-                resp = SESSION.get(full_link, timeout=10)
-                resp.raise_for_status()
-                child_soup = BeautifulSoup(resp.text, "lxml")
+                # Determine cache path
+                cache_dir = os.path.join("websites", netloc)
+                os.makedirs(cache_dir, exist_ok=True)
+                filename = sanitize_filename(full_link)
+                cache_path = os.path.join(cache_dir, filename)
 
-                # Prefer structured JSON-LD content when available
+                if useCache and os.path.exists(cache_path):
+                    with open(cache_path, "r", encoding="utf-8") as fh:
+                        child_html = fh.read()
+                    child_soup = BeautifulSoup(child_html, "lxml")
+                else:
+                    # Polite delay between requests
+                    time.sleep(random.uniform(0.5, 1.3))
+                    resp = SESSION.get(full_link, timeout=10)
+                    resp.raise_for_status()
+                    child_html = resp.text
+                    child_soup = BeautifulSoup(child_html, "lxml")
+                    try:
+                        with open(cache_path, "w", encoding="utf-8") as fh:
+                            fh.write(child_html)
+                    except Exception as e:
+                        print(f"Warning: failed to write cache {cache_path}: {e}")
+
+                # Prefer structured JSON-LD content when available; if present, produce single token entry
                 jsonld_text = _extract_text_from_jsonld(child_soup)
                 if jsonld_text:
-                    text += " " + jsonld_text
+                    child_tokens = tokenize(jsonld_text)
+                    child_key = os.path.relpath(cache_path)
+                    results.append({"file": child_key, "tokens": child_tokens})
                 else:
                     # Recurse into the child page, passing along visited set
-                    # Derive a base for relative links on the child page
                     child_base = f"{urlparse(full_link).scheme}://{urlparse(full_link).netloc}"
-                    text += " ".join(processSoup(child_soup, scrapeForDomain, maxScrapeDepth-1, base_url=child_base, visited=visited))
+                    child_results = processSoup(child_soup, scrapeForDomain, maxScrapeDepth-1, base_url=child_base, visited=visited, source_name=os.path.relpath(cache_path), useCache=useCache)
+                    results.extend(child_results)
             except Exception as e:
                 exc_type, exc_obj, exc_tb = sys.exc_info()
                 print(f"Error scraping {full_link}: {e} on line {exc_tb.tb_lineno}")
 
-    return tokenize(text)
+    return results
 
 
 # %%
 
-def generateIndexes():
+def generateIndexes(useCache=True):
     global postings
     global docID
     global vocabID
     # Processes every file in the wiki folder
 
     # Adds terms to the index
-    folder_name = "websites/bbcgoodfood"
+    folder_name = "websites/startingpages"
     #folder_name = "../ueasmall"
     print("Processing "+str(len(os.listdir(folder_name)))+" files...")
     for file in os.listdir(folder_name):
-        f = open("" + folder_name+ "/" + file, "r", encoding="utf8")
+        file_path = os.path.join(folder_name, file)
+        with open(file_path, "r", encoding="utf8") as f:
+            entries = processFile(f, scrapeForDomain="https://www.hellofresh.co.uk", maxScrapeDepth=2, useCache=useCache)
 
-        tokens = processFile(f, scrapeForDomain="bbcgoodfood.com", maxScrapeDepth=2)
+        # entries is a list of {file: str, tokens: list}
+        for entry in entries:
+            file_key = entry.get("file")
+            tokens = entry.get("tokens", [])
 
-        # Adds file to docID
-        if file not in docID:
-            docID[file] = len(docID)
-        d = docID[file]
+            # Adds file to docID
+            if file_key not in docID:
+                docID[file_key] = len(docID)
+            d = docID[file_key]
 
-        for term in tokens:  # Loops through and adds occurrence of term into index
-            # Gets vocabID
-            if term not in vocabID:
-                vocabID[term] = len(vocabID)
-            t = vocabID[term]
+            for term in tokens:  # Loops through and adds occurrence of term into index
+                # Gets vocabID
+                if term not in vocabID:
+                    vocabID[term] = len(vocabID)
+                t = vocabID[term]
 
-            # Adds term to postings
-            if t not in postings:
-                postings[t] = {d: {
-                    "frequency": 0}}  # Makes new entry in postings for term for the page with frequency set to 0 to start with
-            if d not in postings[t]:
-                postings[t][d] = {"frequency": 0}  # Makes new entry for the term with frequency set to 0 to start with
-            page = postings[t][d]
-            page["frequency"] += 1
+                # Adds term to postings
+                if t not in postings:
+                    postings[t] = {d: {"frequency": 0}}  # Makes new entry in postings for term for the page with frequency set to 0 to start with
+                if d not in postings[t]:
+                    postings[t][d] = {"frequency": 0}  # Makes new entry for the term with frequency set to 0 to start with
+                page = postings[t][d]
+                page["frequency"] += 1
 
     # Saves postings
     print("Saving data")
@@ -434,15 +493,15 @@ while command != "exit":
             print("Results: " + str(results))
 
             # Makes graph of results and their scores
-            scores = [float(list(r.values())[0]) for r in results]
-            x = [list(r.keys())[0] for r in results]
-            plt.bar(x,scores)
-            plt.title("\""+command+"\"")
-            plt.xlabel("Words")
-            plt.ylabel("Score")
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            plt.show()
+            # scores = [float(list(r.values())[0]) for r in results]
+            # x = [list(r.keys())[0] for r in results]
+            # plt.bar(x,scores)
+            # plt.title("\""+command+"\"")
+            # plt.xlabel("Words")
+            # plt.ylabel("Score")
+            # plt.xticks(rotation=45)
+            # plt.tight_layout()
+            # plt.show()
 
             t1 = time.perf_counter()
             print("Time taken: " + str(round(t1 - t0, 100)) + " seconds")
