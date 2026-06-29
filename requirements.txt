@@ -4,6 +4,8 @@ nltk
 spacy
 matplotlib
 numpy
+flask
+flask_cors
 
 # Additional setup (not installed via pip by default):
 # - Download spaCy model: python -m spacy download en_core_web_sm

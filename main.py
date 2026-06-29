@@ -722,51 +722,44 @@ def clearData():
 
 # %%
 
-# Console
-
-command = ""
-loadData()
-while command != "exit":
-    command = input("command: ")
-    t0 = time.perf_counter()
-    if command == "process":
-        clearData()
-        generateIndexes()
-        loadData()
-    elif command == "query":
-        command = input("query: ")
-        while command != "<":
-            t0 = time.perf_counter()
-            loadData() # Resets document scores
-            results = query(command)
-            print("Results: " + str(results))
-
-            # Makes graph of results and their scores
-            # scores = [float(list(r.values())[0]) for r in results]
-            # x = [list(r.keys())[0] for r in results]
-            # plt.bar(x,scores)
-            # plt.title("\""+command+"\"")
-            # plt.xlabel("Words")
-            # plt.ylabel("Score")
-            # plt.xticks(rotation=45)
-            # plt.tight_layout()
-            # plt.show()
-
-            t1 = time.perf_counter()
-            print("Time taken: " + str(round(t1 - t0, 100)) + " seconds")
+def main_cli():
+    """Interactive console entrypoint. Guarded so importing this module
+    from other code (like an API server) doesn't start the CLI loop.
+    """
+    command = ""
+    loadData()
+    while command != "exit":
+        command = input("command: ")
+        t0 = time.perf_counter()
+        if command == "process":
+            clearData()
+            generateIndexes()
+            loadData()
+        elif command == "query":
             command = input("query: ")
-    elif command == "clear":
-        clearData()
-    elif command == "help":
-        print("\033[1mProgram functions:\033[0m")
-        print("exit - exits program")
-        print("process - indexes and processes files")
-        print("query - enters query mode (exit by entering \"<\")")
-        print("clear - clears all stored data")
-        print("help - well I think you already know what this does")
-        print("")
+            while command != "<":
+                t0 = time.perf_counter()
+                loadData()  # Resets document scores
+                results = query(command)
+                print("Results: " + str(results))
 
-    t1 = time.perf_counter()
-    print("Time taken: " + str(round(t1 - t0, 100)) + " seconds")
+                t1 = time.perf_counter()
+                print("Time taken: " + str(round(t1 - t0, 100)) + " seconds")
+                command = input("query: ")
+        elif command == "clear":
+            clearData()
+        elif command == "help":
+            print("\033[1mProgram functions:\033[0m")
+            print("exit - exits program")
+            print("process - indexes and processes files")
+            print("query - enters query mode (exit by entering \"<\")")
+            print("clear - clears all stored data")
+            print("help - well I think you already know what this does")
+            print("")
 
-# %%
+        t1 = time.perf_counter()
+        print("Time taken: " + str(round(t1 - t0, 100)) + " seconds")
+
+
+if __name__ == "__main__":
+    main_cli()
